@@ -1,0 +1,477 @@
+# =============================================================
+# GLM-4.7-Flash PD Disaggregation on p5en.48xlarge (HyperPod EKS)
+#
+# Adapted from: haozhx23/HyperPod-InstantStart pd-glm template
+# Model: zai-org/GLM-4.7-Flash (30B MoE, A3B active, FP8/BF16)
+# Instance: 2x ml.p5en.48xlarge (8x H200 141GB, 16x EFA per node)
+# Image: 763104351884.dkr.ecr.us-east-2.amazonaws.com/sglang:0.5.9-gpu-py312-cu129-ubuntu24.04-ec2
+#
+# Architecture:
+#   Prefill StatefulSet (1 pod, TP=8) -> nixl LIBFABRIC (KV cache) -> Decode StatefulSet (1 pod, TP=8)
+#   Router Deployment -> routes requests to prefill/decode
+#
+# Deploy:
+#   kubectl apply -f sgl-pd-glm-flash-p5en.yaml
+#
+# Test:
+#   kubectl exec -it sgl-router-xxx -- curl -s http://127.0.0.1:8000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"/models/models/GLM-5-FP8","messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
+# =============================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sgl-pd-glm-config
+  namespace: kubeflow
+data:
+  server_config.yaml: |
+    model_path: /models/models/GLM-5-FP8
+    tensor_parallel_size: 8
+    max_running_requests: 1024
+    max_total_tokens: 100000
+
+---
+# Headless service for prefill pod DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-prefill-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: pd-prefill
+  ports:
+    - port: 30000
+      name: worker
+    - port: 8998
+      name: bootstrap
+
+---
+# Headless service for decode pod DNS
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-decode-headless
+  namespace: kubeflow
+spec:
+  clusterIP: None
+  selector:
+    app: pd-decode
+  ports:
+    - port: 30001
+      name: worker
+
+---
+# ClusterIP service for prefill
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-prefill
+  namespace: kubeflow
+spec:
+  type: ClusterIP
+  selector:
+    app: pd-prefill
+  ports:
+    - port: 30000
+      targetPort: 30000
+      name: http
+    - port: 8998
+      targetPort: 8998
+      name: bootstrap
+
+---
+# ClusterIP service for decode
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-decode
+  namespace: kubeflow
+spec:
+  type: ClusterIP
+  selector:
+    app: pd-decode
+  ports:
+    - port: 30001
+      targetPort: 30001
+
+---
+# Router service (entry point)
+apiVersion: v1
+kind: Service
+metadata:
+  name: pd-router
+  namespace: kubeflow
+spec:
+  type: ClusterIP
+  selector:
+    app: pd-router
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# ========================
+# Prefill StatefulSet
+# ========================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pd-prefill
+  namespace: kubeflow
+spec:
+  serviceName: pd-prefill-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-prefill
+  template:
+    metadata:
+      labels:
+        app: pd-prefill
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: ["ml.p5en.48xlarge"]
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: pd-prefill
+          image: 596899493901.dkr.ecr.us-east-2.amazonaws.com/sgl-dev-cu13:20260402013115
+          ports:
+            - containerPort: 30000
+            - containerPort: 8998
+          env:
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            # EFA / libfabric
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            - name: FI_MR_CACHE_MONITOR
+              value: "disabled"
+            - name: FI_LOG_LEVEL
+              value: "warn"
+            # NCCL - intra-node only (TP=8 via NVLink)
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_PROTO
+              value: "Simple"
+            # NIXL - KV cache transfer via LIBFABRIC/EFA RDMA
+            - name: SGLANG_DISAGGREGATION_NIXL_BACKEND
+              value: "LIBFABRIC"
+            - name: NIXL_LOG_LEVEL
+              value: "info"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "16"
+              memory: 256Gi
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "16"
+              memory: 1024Gi
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          volumeMounts:
+            - name: nvme
+              mountPath: /nvme
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /bin/bash
+            - -c
+            - |
+              MODEL_LOCAL="/nvme/GLM-5-FP8"
+
+              if [ ! -f "${MODEL_LOCAL}/config.json" ]; then
+                echo "ERROR: Model not found at ${MODEL_LOCAL}. Download first."
+                exit 1
+              fi
+              echo "Model found on local NVMe."
+
+              echo "Starting GLM-5-FP8 Prefill server (TP=8, p5en.48xlarge)"
+
+              python -m sglang.launch_server \
+                --model-path "${MODEL_LOCAL}" \
+                --tp-size 8 \
+                --trust-remote-code \
+                --host 0.0.0.0 \
+                --port 30000 \
+                --context-length 32768 \
+                --mem-fraction-static 0.85 \
+                --max-running-requests 16 \
+                --chunked-prefill-size 8192 \
+                --disaggregation-mode prefill \
+                --disaggregation-transfer-backend nixl \
+                --disaggregation-bootstrap-port 8998 \
+                --disable-cuda-graph \
+                --disable-radix-cache \
+                --watchdog-timeout 1200 \
+                --enable-metrics
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /opt/dlami/nvme
+            type: DirectoryOrCreate
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+
+---
+# ========================
+# Decode StatefulSet
+# ========================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pd-decode
+  namespace: kubeflow
+spec:
+  serviceName: pd-decode-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-decode
+  template:
+    metadata:
+      labels:
+        app: pd-decode
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: ["ml.p5en.48xlarge"]
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values: ["pd-prefill"]
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: pd-decode
+          image: 596899493901.dkr.ecr.us-east-2.amazonaws.com/sgl-dev-cu13:20260402013115
+          ports:
+            - containerPort: 30001
+          env:
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,1,2,3,4,5,6,7"
+            # EFA / libfabric
+            - name: FI_PROVIDER
+              value: "efa"
+            - name: FI_EFA_USE_DEVICE_RDMA
+              value: "1"
+            - name: FI_EFA_FORK_SAFE
+              value: "1"
+            - name: FI_EFA_USE_HUGE_PAGE
+              value: "0"
+            - name: FI_MR_CACHE_MONITOR
+              value: "disabled"
+            - name: FI_LOG_LEVEL
+              value: "warn"
+            # NCCL - intra-node only
+            - name: NCCL_DEBUG
+              value: "INFO"
+            - name: NCCL_PROTO
+              value: "Simple"
+            # NIXL
+            - name: SGLANG_DISAGGREGATION_NIXL_BACKEND
+              value: "LIBFABRIC"
+            - name: NIXL_LOG_LEVEL
+              value: "info"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "16"
+              memory: 256Gi
+            limits:
+              nvidia.com/gpu: "8"
+              vpc.amazonaws.com/efa: "16"
+              memory: 1024Gi
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          volumeMounts:
+            - name: nvme
+              mountPath: /nvme
+            - name: shm
+              mountPath: /dev/shm
+          command:
+            - /bin/bash
+            - -c
+            - |
+              MODEL_LOCAL="/nvme/GLM-5-FP8"
+
+              if [ ! -f "${MODEL_LOCAL}/config.json" ]; then
+                echo "ERROR: Model not found at ${MODEL_LOCAL}. Download first."
+                exit 1
+              fi
+              echo "Model found on local NVMe."
+
+              echo "Starting GLM-5-FP8 Decode server (TP=8, p5en.48xlarge)"
+
+              python -m sglang.launch_server \
+                --model-path "${MODEL_LOCAL}" \
+                --tp-size 8 \
+                --trust-remote-code \
+                --host 0.0.0.0 \
+                --port 30001 \
+                --context-length 32768 \
+                --mem-fraction-static 0.85 \
+                --max-running-requests 32 \
+                --disaggregation-mode decode \
+                --disaggregation-transfer-backend nixl \
+                --disaggregation-bootstrap-port 8998 \
+                --disable-cuda-graph \
+                --disable-radix-cache \
+                --watchdog-timeout 1200 \
+                --enable-metrics
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /opt/dlami/nvme
+            type: DirectoryOrCreate
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+
+---
+# ========================
+# Router Deployment
+# ========================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pd-router
+  namespace: kubeflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pd-router
+  template:
+    metadata:
+      labels:
+        app: pd-router
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: ml.p5en.48xlarge
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: pd-router
+          image: 596899493901.dkr.ecr.us-east-2.amazonaws.com/sgl-dev-cu13:20260402013115
+          ports:
+            - containerPort: 8000
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: nvme
+              mountPath: /nvme
+              readOnly: true
+          command:
+            - /bin/bash
+            - -c
+            - |
+              echo "Waiting for prefill and decode servers..."
+
+              for i in $(seq 1 120); do
+                if curl -s http://pd-prefill:30000/health > /dev/null 2>&1; then
+                  echo "Prefill server ready."
+                  break
+                fi
+                echo "Waiting for prefill... ($i/120)"
+                sleep 10
+              done
+
+              for i in $(seq 1 120); do
+                if curl -s http://pd-decode:30001/health > /dev/null 2>&1; then
+                  echo "Decode server ready."
+                  break
+                fi
+                echo "Waiting for decode... ($i/120)"
+                sleep 10
+              done
+
+              echo "Starting PD Router on port 8000"
+              python3 -m sglang_router.launch_router \
+                --pd-disaggregation \
+                --prefill "http://pd-prefill:30000" \
+                --decode "http://pd-decode:30001" \
+                --tokenizer-path zai-org/GLM-5-FP8 \
+                --control-plane-api-keys "key1:admin:admin:sk-glm5test" \
+                --host 0.0.0.0 \
+                --port 8000
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /opt/dlami/nvme
+            type: Directory
+
+---
+# RBAC for router (if needed for pod discovery)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pd-router-sa
+  namespace: kubeflow
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pd-router-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["watch", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pd-router-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pd-router-role
+subjects:
+  - kind: ServiceAccount
+    name: pd-router-sa
+    namespace: kubeflow
